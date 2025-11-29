@@ -1,171 +1,167 @@
----
+# **iTransformer Autoencoder for Multivariate Financial Time-Series Anomaly Detection**
 
-# 📘 **iTransformer Autoencoder for Financial Time-Series Anomaly Detection**
+**Author:** *Bengisu Duru Göksu, Gebze Technical University, Computer Engineering Department*
 
-*Advanced Deep Learning Model for Detecting Rare Market Irregularities*
+**Project Type:** Deep Learning Research Project — Financial Anomaly Detection
 
----
+## **1. Introduction**
 
-## 🔍 **1. Overview**
+Financial markets exhibit complex temporal dynamics governed by non-linear interactions, volatility regimes, and abrupt structural shifts. Detecting anomalous behaviour in such systems is challenging due to:
 
-This project implements an **iTransformer-based autoencoder** to detect anomalies in multivariate financial time-series data.
-Unlike traditional LSTM or CNN autoencoders, the iTransformer architecture leverages **attention mechanisms** to model long-range dependencies, making it highly effective for financial patterns that evolve over time.
+* Heavy-tailed return distributions
+* High temporal dependency
+* Non-stationary patterns
+* Regime changes during crisis periods
 
-The model is trained on **normal market behaviour only**, enabling it to learn a robust reconstruction manifold.
-When abnormal patterns occur (e.g., sudden volatility spikes), reconstruction error increases sharply — producing a clear anomaly signal.
+This project investigates an **iTransformer-based autoencoder** trained exclusively on *normal market conditions* to learn a robust reconstruction manifold. Deviations from this learned manifold produce measurable increases in reconstruction error (MSE), enabling unsupervised anomaly detection.
 
-This model is evaluated on both:
-
-* **Normal conditions** (AAPL 2021–2023)
-* **Real crash event** (SPY 2020 Pandemic Crash)
+The model is evaluated both on **non-crisis data** (AAPL, 2021–2023) and on a **known real-world shock event** (SPY, COVID-19 market crash, 2020). Results show that the reconstruction error correlates strongly with market stress, demonstrating the effectiveness of Transformer-based architectures in financial anomaly detection tasks.
 
 ---
 
-## 📦 **2. Data & Preprocessing**
+## **2. Dataset and Feature Engineering**
 
-### **2.1 Features Used (9 total)**
+### **2.1 Raw Input**
 
-From the raw OHLCV data we derive:
+Daily OHLCV data is collected using *Yahoo Finance* for the selected asset.
 
-| Feature | Description                        |
-| ------- | ---------------------------------- |
-| Open    | Market opening price               |
-| High    | Daily high                         |
-| Low     | Daily low                          |
-| Close   | Market closing price               |
-| Volume  | Trade volume                       |
-| HL      | High − Low (intraday range)        |
-| OC      | Close − Open                       |
-| RET     | Daily return (Pct change of Close) |
-| VOL_RET | Volume pct change                  |
+### **2.2 Derived Features (Total = 9)**
 
-### **2.2 Windowing**
+| Feature | Description                       |
+| ------- | --------------------------------- |
+| Open    | Opening price                     |
+| High    | Daily high                        |
+| Low     | Daily low                         |
+| Close   | Closing price                     |
+| Volume  | Total traded volume               |
+| HL      | High − Low (intraday range)       |
+| OC      | Close − Open                      |
+| RET     | Percentage return of close prices |
+| VOL_RET | Percentage change in volume       |
 
-Time-series is converted into fixed-length sequences:
+These engineered features enable the model to capture price movement, volatility, and liquidity dynamics simultaneously.
 
-```
-Window length = 64  
-Final shape   = (N, 64, 9)
-```
+### **2.3 Windowing**
 
-Each window represents 64 consecutive days of multivariate market behaviour.
+A sliding window of length **64 days** is applied:
+
+[
+X \in \mathbb{R}^{N \times 64 \times 9}
+]
+
+This representation preserves temporal ordering and allows the Transformer to model sequence-level dependencies.
 
 ---
 
-## 🧠 **3. Model Architecture — iTransformer Autoencoder**
+## **3. Model Architecture**
 
-The autoencoder consists of:
+### **3.1 iTransformer Autoencoder**
 
-* **Input projection layer** → Dense(embed_dim)
-* **N stacked iTransformer blocks**
-* **Output projection** → Dense(num_features)
-
-### **iTransformer Block Details**
-
-Each block includes:
+The architecture consists of an encoder–decoder structure built using **iTransformer blocks**, each containing:
 
 * Multi-Head Self-Attention
 * Position-wise Feedforward Network
-* Layer Normalization
-* Residual Connections
-* Dropout Regularization
+* Layer Normalization layers
+* Residual connections
+* Dropout regularization
 
-This structure allows the model to capture relationships between features across long temporal horizons.
+The model projects the input into an embedding space, processes it through several iTransformer blocks, then reconstructs the original sequence.
+
+### **3.2 Objective Function**
+
+The autoencoder is trained using Mean Squared Error:
+
+[
+\mathcal{L} = \frac{1}{T \cdot F} \sum (X - \hat{X})^2
+]
+
+where
+
+* (T = 64) time steps
+* (F = 9) features
+
+The model learns to minimize reconstruction error for normal market sequences.
 
 ---
 
-## 🏋️ **4. Training Procedure**
+## **4. Training Procedure**
 
-### **Objective**
+* Dataset: Only windows labelled as **normal** (non-anomalous) are used.
+* Optimizer: Adam, learning rate = (1 \times 10^{-4})
+* Epochs: 200
+* Batch size: 32
+* Validation split: 20%
+* Callbacks:
 
-The model is trained to **reconstruct normal sequences**:
+  * EarlyStopping (patience = 10)
+  * ReduceLROnPlateau
+  * ModelCheckpoint (.h5 format for compatibility)
 
-[
-\mathcal{L} = \text{MSE}(X, \hat{X})
-]
-
-### **Important notes**
-
-* Only windows with **normal labels (y = 0)** are used for training.
-* This makes the model sensitive to deviations seen during anomalous periods.
-
-### **Callbacks**
-
-* EarlyStopping (patience=10, restore_best=True)
-* ReduceLROnPlateau (factor=0.5)
-* ModelCheckpoint (saves best model as `.h5`)
+This procedure ensures generalization and prevents overfitting on noise.
 
 ---
 
-## 🚨 **5. Anomaly Detection Method**
+## **5. Anomaly Detection Methodology**
 
-After inference, per-window reconstruction error is computed:
-
-[
-\text{MSE}_i = \frac{1}{64 \times 9} \sum (X_i - \hat{X}_i)^2
-]
-
-Two thresholding strategies are used:
-
-### **(a) Statistical Threshold**
+After inference, window-level anomaly scores are computed as:
 
 [
-T = \mu_{\text{mse}} + 3\sigma
+\text{MSE}_i = \frac{1}{TF} \sum (X_i - \hat{X}_i)^2
 ]
 
-### **(b) Expert-Selected Percentile Method**
+### **5.1 Thresholding Approaches**
 
-For highly noisy data (e.g., SPY crash):
+#### **A. Statistical Threshold**
+
+[
+T = \mu_{\text{MSE}} + 3\sigma
+]
+
+This is suitable for stable datasets but ineffective for crisis data due to heteroskedasticity.
+
+#### **B. Percentile-Based Expert Threshold**
+
+Used for real-market shock periods:
 
 [
 T = \text{95th percentile of MSE}
 ]
 
-This is closer to how financial anomaly detection is done in practice (volatility clustering, fat-tailed distributions, etc.).
+This approach is more aligned with financial modelling practices, where distributions are non-Gaussian and volatility clustering is strong.
 
 ---
 
-## 📊 **6. Real-World Stress Test — SPY 2020 Pandemic Crash**
+## **6. Real-World Evaluation: SPY 2020 COVID-19 Market Crash**
 
-The SPY ETF experienced a rapid crash from **February–March 2020**, a perfect test scenario for model robustness.
+### **6.1 Motivation**
 
-### **Procedure**
+The SPY crash (Feb–Mar 2020) represents a significant structural break, making it an ideal benchmark for anomaly detection models.
 
-1. Download SPY OHLCV data from **2019-09 to 2020-07**
-2. Apply identical preprocessing and windowing (shape = `(144, 64, 9)`)
-3. Run model inference
-4. Compute reconstruction error curve
-5. Apply percentile-based threshold
-6. Overlay detected anomalies on price chart
+### **6.2 Procedure**
 
-### **Findings**
+1. Download SPY data from **2019-09 to 2020-07**
+2. Apply identical preprocessing pipeline
+3. Generate sliding windows (shape: 144 × 64 × 9)
+4. Run inference using the trained iTransformer model
+5. Compute reconstruction error
+6. Apply **95th percentile threshold**
 
-* The model shows a **steady increase in reconstruction error** as volatility rises.
-* Peak error coincides with the **sharpest price drawdowns**.
-* Using percentile threshold, the model correctly flags **4 anomaly windows** during the crash.
-* This demonstrates meaningful sensitivity to real-world market stress.
+### **6.3 Findings**
 
----
+* The reconstruction error exhibits a **sharp rise starting at the early decline of SPY**.
+* The model detects anomalies consistently at the peak volatility phase.
+* Using the percentile method, **four anomaly windows** are correctly identified near the lowest price points.
+* The temporal alignment between anomaly spikes and market stress demonstrates:
 
-## 📈 **7. Example Outputs**
-
-### **Reconstruction Error Curve**
-
-Shows model sensitivity during SPY crash.
-
-### **Price vs Scaled MSE**
-
-MSE is normalized and scaled against price for clear visual comparison.
-
-### **Detected Anomalies**
-
-Anomalies are marked as black dots on the price chart — aligning with crash dynamics.
+  * Sensitivity to regime shifts
+  * Capability to capture multi-feature deviations
+  * Strong generalization to unseen crisis data
 
 ---
 
-## 🧪 **8. How to Run**
+## **7. Reproducibility Instructions**
 
-### **1. Load the model**
+### **7.1 Model Loading**
 
 ```python
 model = keras.models.load_model(
@@ -174,43 +170,41 @@ model = keras.models.load_model(
 )
 ```
 
-### **2. Prepare your financial dataset**
+### **7.2 Data Preparation**
 
 ```python
-df = yf.download("AAPL", start="2021-01-01", end="2023-01-01")
-df = preprocess(df)   # includes engineering HL, OC, RET, VOL_RET
+df = preprocess(df_raw)
 windows = create_windows(df.values)
 ```
 
-### **3. Run inference**
+### **7.3 Inference**
 
 ```python
 recon = model.predict(windows)
-mse = np.mean((windows - recon)**2, axis=(1,2))
+mse = np.mean((windows - recon)**2, axis=(1, 2))
 ```
 
-### **4. Apply threshold**
+### **7.4 Thresholding**
 
 ```python
 threshold = np.percentile(mse, 95)
 anomalies = mse > threshold
 ```
 
-### **5. Plot**
-
-Included in the repository as `visualize_anomalies.py`.
-
 ---
 
-## 🧾 **9. Conclusion**
+## **8. Conclusion**
 
-This project demonstrates that:
+This study demonstrates that the iTransformer autoencoder effectively models normal market behaviour and produces meaningful anomaly scores during abnormal market conditions.
 
-* **Transformers can model financial time-series more effectively** than recurrent or convolutional models.
-* An autoencoder trained only on normal regime dynamics can detect **abrupt regime shifts**.
-* The model successfully identified anomalies during a **major real-world market event** (COVID-19 crash).
+The model successfully detected anomalies in the **2020 COVID-19 crash**, validating its utility for:
 
-This provides strong evidence that iTransformer-based reconstruction errors are a viable signal for financial anomaly detection.
+* Regime shift detection
+* Market crash early-warning indicators
+* Multivariate financial anomaly analysis
+* Unsupervised risk monitoring
+
+The iTransformer architecture’s ability to capture long-range dependencies makes it a strong candidate for advanced financial time-series modelling.
 
 ---
 
