@@ -10,44 +10,54 @@ df = yf.download(
     auto_adjust=False,
     progress=False
 ).reset_index()
-
 df = df[["Date", "Close"]].dropna().reset_index(drop=True)
-import os, json, joblib
 
+import os, json, joblib
 ARTIFACT_DIR = "/content/drive/MyDrive/anomaly_project/artifacts_cnn"
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+# --- FEATURE ENGINEERING (LSTM ile aynı) ---
 df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
+
+df["abs_return"] = df["log_return"].abs()
+df["rolling_std_7"]  = df["log_return"].rolling(7).std()
+df["rolling_std_30"] = df["log_return"].rolling(30).std()
+
+eps = 1e-8
+df["norm_return"] = df["log_return"] / (df["rolling_std_30"] + eps)
+
 df = df.dropna().reset_index(drop=True)
+
 split_ratio = 0.7
 split_idx = int(len(df) * split_ratio)
 
-train_returns = df["log_return"].values[:split_idx]
-test_returns  = df["log_return"].values[split_idx:]
+FEATURES = ["norm_return", "abs_return", "rolling_std_7", "rolling_std_30"]
+
+train_feat = df[FEATURES].values[:split_idx]
+test_feat  = df[FEATURES].values[split_idx:]
 
 train_dates = df["Date"].values[:split_idx]
-test_dates  = df["Date"].values[split_idx:]
-
-print(train_returns.shape, test_returns.shape)
-from sklearn.preprocessing import StandardScaler
+test_dates  = df["Date"].values[split_idx:]from sklearn.preprocessing import StandardScaler
 
 scaler = StandardScaler()
+train_scaled = scaler.fit_transform(train_feat)   # (N, 4)
+test_scaled  = scaler.transform(test_feat)        # (M, 4)
 
-train_scaled = scaler.fit_transform(train_returns.reshape(-1,1)).ravel()
-test_scaled  = scaler.transform(test_returns.reshape(-1,1)).ravel()
-
-print(train_scaled.mean(), train_scaled.std())  # ~0, ~1
 joblib.dump(
     scaler,
     f"{ARTIFACT_DIR}/cnn_return_scaler.joblib"
 )
+
 WINDOW = 32
+
 meta = {
     "model": "1D-CNN",
     "window": WINDOW,
     "split_ratio": split_ratio,
     "task": "log-return next-step forecasting",
-    "anomaly_method": "residual percentile",
-    "threshold_percentile": 97
+    "anomaly_method": "residual + stress + MAD",
+    "stress_percentile": 90,
+    "mad_k": 2.5
 }
 
 with open(
@@ -56,31 +66,26 @@ with open(
 ) as f:
     json.dump(meta, f, indent=2)
 
+def make_windows_multifeat(X, w, target_col=0):
+    Xs, ys = [], []
+    for i in range(len(X) - w):
+        Xs.append(X[i:i+w, :])          # (w, F)
+        ys.append(X[i+w, target_col])   # norm_return hedefi
+    return np.array(Xs), np.array(ys)
 
-def make_windows(x, w):
-    X, y = [], []
-    for i in range(len(x) - w):
-        X.append(x[i:i+w])
-        y.append(x[i+w])
-    return np.array(X), np.array(y)
+X_train, y_train = make_windows_multifeat(train_scaled, WINDOW, target_col=0)
+X_test,  y_test  = make_windows_multifeat(test_scaled,  WINDOW, target_col=0)
 
-X_train, y_train = make_windows(train_scaled, WINDOW)
-X_test,  y_test  = make_windows(test_scaled,  WINDOW)
-
-# CNN input: (N, 32, 1)
-X_train = X_train[..., None]
-X_test  = X_test[..., None]
-
-print(X_train.shape, y_train.shape)
-print(X_test.shape, y_test.shape)
-import tensorflow as tf
+print(X_train.shape, y_train.shape)   # (N, 32, 4)
+print(X_test.shape, y_test.shape)     # (M, 32, 4)import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Conv1D, GlobalAveragePooling1D, Dense
 from tensorflow.keras.callbacks import EarlyStopping
 
 tf.keras.utils.set_random_seed(42)
 
-inputs = Input(shape=(WINDOW, 1))
+inputs = Input(shape=(WINDOW, len(FEATURES)))   # (32, 4)
+
 
 x = Conv1D(64, 3, activation="relu", padding="same")(inputs)
 x = Conv1D(64, 3, activation="relu", padding="same")(x)
@@ -113,6 +118,9 @@ model.save(
     f"{ARTIFACT_DIR}/cnn_return_anomaly_w32.keras"
 )
 
+# ==========================================
+# 1) RESIDUAL HESAPLAMA
+# ==========================================
 yhat_tr = model.predict(X_train, verbose=0).ravel()
 yhat_te = model.predict(X_test,  verbose=0).ravel()
 
@@ -121,97 +129,111 @@ res_te = np.abs(y_test  - yhat_te)
 
 print("Train residual mean/std:", res_tr.mean(), res_tr.std())
 print("Test  residual mean/std:", res_te.mean(), res_te.std())
-thr = np.percentile(res_tr, 97)
-anomaly = (res_te > thr).astype(int)
 
+# ==========================================
+# 2) STRESS MASK OLUŞTURMA
+# ==========================================
+abs_ret_full = df["abs_return"].values
+std30_full   = df["rolling_std_30"].values
+
+abs_ret_test = abs_ret_full[split_idx + WINDOW:]
+std30_test   = std30_full[split_idx + WINDOW:]
+
+assert len(abs_ret_test) == len(res_te)
+
+q = 90
+abs_ret_thr = np.percentile(abs_ret_test, q)
+stress_mask = (abs_ret_test > abs_ret_thr).astype(int)
+
+print(f"Stress threshold (|return| {q}th pct):", abs_ret_thr)
+print("Stress day rate:", stress_mask.mean())
+
+# ==========================================
+# 3) VOLATILITE-NORMALIZED RESIDUAL
+# ==========================================
+eps = 1e-8
+
+norm_res_te = res_te / (std30_test + eps)
+
+std30_train = df["rolling_std_30"].values[:split_idx]
+std30_train = std30_train[WINDOW:]
+norm_res_tr = res_tr / (std30_train + eps)
+
+print("Normalized residual test mean/std:", norm_res_te.mean(), norm_res_te.std())
+
+# ==========================================
+# 4) MAD THRESHOLD + ANOMALY
+# ==========================================
+def mad_threshold(residuals, k=2.5):
+    med = np.median(residuals)
+    mad = np.median(np.abs(residuals - med)) + 1e-12
+    return med + k * 1.4826 * mad
+
+thr = mad_threshold(norm_res_tr, k=2.5)
+
+raw_anomaly = (norm_res_te > thr).astype(int)
+anomaly = ((norm_res_te > thr) & (stress_mask == 1)).astype(int)
+
+print("Residual-only anomaly rate:", raw_anomaly.mean())
+print("Final (residual+stress) anomaly rate:", anomaly.mean())
 print("Threshold:", thr)
-print("Anomaly rate:", anomaly.mean())
-thr = np.percentile(res_tr, 97)
+print("Raw anomaly count:", raw_anomaly.sum())
+print("Final anomaly count:", anomaly.sum())
 
+# threshold kaydetmek istersen:
 with open(
-    f"{ARTIFACT_DIR}/cnn_threshold_p97.txt",
+    f"{ARTIFACT_DIR}/cnn_threshold_mad.txt",
     "w"
 ) as f:
     f.write(str(thr))
-import matplotlib.pyplot as plt
 
+# ==========================================
+# 5) PLOT (LOG-RETURN + PRICE, 2021)
+# ==========================================
 dates_test = test_dates[WINDOW:]
+price_test = df["Close"].values[split_idx + WINDOW:]
 
-plt.figure(figsize=(14,4))
-plt.plot(dates_test, y_test, label="Log-return", alpha=0.7)
-
+import matplotlib.pyplot as plt
 idx = np.where(anomaly == 1)[0]
-plt.scatter(dates_test[idx], y_test[idx],
-            color="red", s=25, label="Anomaly")
 
-plt.title("1D-CNN Log-return Anomaly Detection (WINDOW=32)")
+# Log-return grafiği
+plt.figure(figsize=(14,4))
+plt.plot(dates_test, y_test, label="Norm return", alpha=0.7)
+plt.scatter(dates_test[idx], y_test[idx], color="red", s=25, label="Anomaly")
+plt.title("1D-CNN Norm-return Anomaly Detection")
 plt.xlabel("Date")
-plt.ylabel("Log-return")
+plt.ylabel("Norm return")
 plt.legend()
 plt.tight_layout()
 plt.show()
-mae_cnn = np.mean(np.abs(y_test - yhat_te))
-print("CNN MAE:", mae_cnn)
-big = np.abs(y_test) > np.percentile(np.abs(y_test), 99)
 
-print("Big returns:", big.sum())
-print("Big & detected:",
-      np.sum((big == 1) & (anomaly == 1)))
-# test döneminin price'ı
-test_close = df["Close"].values[split_idx:]
+# Sadece 2021 fiyat grafiği
+dates_test_dt = pd.to_datetime(dates_test)
+mask_2021 = (dates_test_dt >= "2021-01-01") & (dates_test_dt < "2022-01-01")
 
-# window yüzünden ilk WINDOW günü düşür
-test_close_aligned = test_close[WINDOW:]
+dates_2021 = dates_test_dt[mask_2021]
+price_2021 = price_test[mask_2021]
+anomaly_2021 = anomaly[mask_2021]
 
-# dates zaten vardı
-dates_test = test_dates[WINDOW:]
-
-print(len(test_close_aligned), len(anomaly))
-import matplotlib.pyplot as plt
-import numpy as np
-
-plt.figure(figsize=(15,5))
-
-# price
-plt.plot(dates_test, test_close_aligned,
-         label="ETH Close Price (test)",
-         linewidth=2)
-
-# anomaly noktaları
-idx = np.where(anomaly == 1)[0]
-plt.scatter(
-    dates_test[idx],
-    test_close_aligned[idx],
-    color="red",
-    s=35,
-    label="Anomaly (return-based)"
-)
-
-plt.title("ETH Price vs Anomaly (1D-CNN return-based)")
+plt.figure(figsize=(16,4))
+plt.plot(dates_2021, price_2021, label="Price")
+idx_2021 = np.where(anomaly_2021 == 1)[0]
+plt.scatter(dates_2021[idx_2021], price_2021[idx_2021], color="red", s=30, label="Anomaly")
+plt.title("Price vs Anomaly (1D-CNN, 2021 Only)")
 plt.xlabel("Date")
 plt.ylabel("Price")
-plt.xticks(rotation=45)
 plt.legend()
 plt.tight_layout()
 plt.show()
-for q in [95, 97, 99]:
-    thr_q = np.percentile(res_tr, q)
-    anomaly_q = (res_te > thr_q)
-    overlap = np.sum(big & anomaly_q)
-    print(f"thr p{q}: anomalies={anomaly_q.mean():.3f}, big detected={overlap}/{big.sum()}")
-# naive prediction
-yhat_naive = X_test[:, -1, 0]   # son return
 
-res_naive = np.abs(y_test - yhat_naive)
-res_gru   = np.abs(y_test - yhat_te)
+# ==========================================
+# 6) NAIVE vs CNN MAE
+# ==========================================
+from sklearn.metrics import mean_absolute_error
 
-print("Naive MAE:", res_naive.mean())
-print("1dcnn   MAE:", res_gru.mean())
-import matplotlib.pyplot as plt
+yhat_naive = X_test[:, -1, 0]   # son norm_return
+mae_naive = mean_absolute_error(y_test, yhat_naive)
+mae_cnn   = mean_absolute_error(y_test, yhat_te)
 
-plt.figure(figsize=(6,4))
-plt.hist(res_gru, bins=50, alpha=0.7, label="1dcnn residual")
-plt.hist(res_naive, bins=50, alpha=0.5, label="Naive residual")
-plt.legend()
-plt.title("Residual Distribution Comparison")
-plt.show()
+print("NAIVE MAE:", mae_naive)
+print("CNN   MAE:", mae_cnn)
